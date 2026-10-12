@@ -17,6 +17,8 @@ import numpy as np
 import procfunc as pf
 import trimesh
 
+from infinigen2.scenes.placement import forgeo
+
 __all__ = [
     "CollisionSet",
     "any_self_collision",
@@ -33,12 +35,17 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class CollisionSet:
     objs: list[pf.Object]
-    collision_manager: trimesh.collision.CollisionManager
+    collision_manager: trimesh.collision.CollisionManager | None  # None with forGeo
     object_names: dict[int, str]
     mesh_colliders: dict[int, trimesh.Trimesh]
     mesh_fcl_colliders: dict[int, Any]
     object_fcl_objs: dict[int, Any]  # object_id -> fcl.CollisionObject in manager
     object_last_transforms: dict[int, np.ndarray]  # object_id -> last synced transform
+    # forGeo backend (forgeo.LIB set): BVH per mesh, and per object its BVH and
+    # world bounds as of object_last_transforms
+    mesh_bvhs: dict[int, forgeo.MeshBVH]
+    object_bvhs: dict[int, forgeo.MeshBVH]
+    object_bounds: dict[int, np.ndarray]
 
 
 def _is_collidable_object(obj: pf.Object) -> bool:
@@ -165,6 +172,43 @@ def _sync_transforms(col: CollisionSet) -> None:
         col.collision_manager._manager.update()
 
 
+def _mesh_bvh(
+    mesh_bvhs: dict[int, forgeo.MeshBVH], mesh_id: int, mesh: trimesh.Trimesh
+) -> forgeo.MeshBVH:
+    bvh = mesh_bvhs.get(mesh_id)
+    if bvh is None:
+        # convexity decides solid vs hollow, exactly as trimesh's _get_fcl_obj
+        # picks fcl.Convex vs fcl.BVHModel
+        bvh = forgeo.build(mesh.vertices, mesh.faces, mesh.is_convex)
+        mesh_bvhs[mesh_id] = bvh
+    return bvh
+
+
+def _forgeo_colliders(col: CollisionSet):
+    """(BVH, transform, world bounds) per collider. Like _sync_transforms, a
+    moved collider is re-checked for rigidity and its bounds refreshed."""
+    for obj in col.objs:
+        oid = _object_id(obj)
+        T = _object_transform(obj)
+        if not np.array_equal(col.object_last_transforms.get(oid), T):
+            _assert_rigid(obj, T)
+            col.object_last_transforms[oid] = T
+            col.object_bounds[oid] = forgeo.world_bounds(col.object_bvhs[oid], T)
+        yield col.object_bvhs[oid], T, col.object_bounds[oid]
+
+
+def _bounds_overlap(a: np.ndarray, b: np.ndarray) -> bool:
+    return bool(np.all(a[0] <= b[1]) and np.all(b[0] <= a[1]))
+
+
+def _forgeo_any_overlap(col: CollisionSet, probe: Any, T: np.ndarray) -> bool:
+    bounds = forgeo.world_bounds(probe, T)
+    for bvh, T_c, bounds_c in _forgeo_colliders(col):
+        if _bounds_overlap(bounds, bounds_c) and forgeo.overlap(bvh, T_c, probe, T):
+            return True
+    return False
+
+
 def n_colliders(col: CollisionSet) -> int:
     return len(col.object_names)
 
@@ -181,7 +225,12 @@ def collision_set(
     object_names: dict[int, str] = {}
     object_fcl_objs: dict[int, Any] = {}
     object_last_transforms: dict[int, np.ndarray] = {}
-    manager = trimesh.collision.CollisionManager()
+    mesh_bvhs: dict[int, forgeo.MeshBVH] = (
+        {} if cache is None else dict(cache.mesh_bvhs)
+    )
+    object_bvhs: dict[int, forgeo.MeshBVH] = {}
+    object_bounds: dict[int, np.ndarray] = {}
+    manager = None if forgeo.LIB is not None else trimesh.collision.CollisionManager()
     collidable_objs: list[pf.Object] = []
 
     bpy.context.view_layer.update()
@@ -199,6 +248,15 @@ def collision_set(
                 collidable_objs.pop()
                 continue
 
+        if forgeo.LIB is not None:
+            oid = _object_id(obj)
+            bvh = _mesh_bvh(mesh_bvhs, mesh_id, mesh_colliders[mesh_id])
+            object_names[oid] = _mesh_name(obj)
+            object_bvhs[oid] = bvh
+            object_last_transforms[oid] = T
+            object_bounds[oid] = forgeo.world_bounds(bvh, T)
+            continue
+
         fcl_geom = mesh_fcl_colliders.get(mesh_id)
         if fcl_geom is None:
             fcl_geom = manager._get_fcl_obj(mesh_colliders[mesh_id])
@@ -211,7 +269,8 @@ def collision_set(
         object_names[oid] = name
         object_fcl_objs[oid] = col_obj
         object_last_transforms[oid] = T
-    manager._manager.update()
+    if manager is not None:
+        manager._manager.update()
 
     return CollisionSet(
         objs=collidable_objs,
@@ -221,6 +280,9 @@ def collision_set(
         mesh_fcl_colliders=mesh_fcl_colliders,
         object_fcl_objs=object_fcl_objs,
         object_last_transforms=object_last_transforms,
+        mesh_bvhs=mesh_bvhs,
+        object_bvhs=object_bvhs,
+        object_bounds=object_bounds,
     )
 
 
@@ -232,7 +294,8 @@ def intersection_test(col: CollisionSet, obj: pf.Object) -> bool:
     bpy.context.view_layer.update()
     T = _object_transform(obj)
     _assert_rigid(obj, T)
-    _sync_transforms(col)
+    if forgeo.LIB is None:
+        _sync_transforms(col)
 
     mesh_id = _mesh_id(obj)
     geom = col.mesh_colliders.get(mesh_id)
@@ -242,6 +305,9 @@ def intersection_test(col: CollisionSet, obj: pf.Object) -> bool:
         except ValueError:
             return False
         col.mesh_colliders[mesh_id] = geom
+
+    if forgeo.LIB is not None:
+        return _forgeo_any_overlap(col, _mesh_bvh(col.mesh_bvhs, mesh_id, geom), T)
 
     fcl_geom = col.mesh_fcl_colliders.get(mesh_id)
     if fcl_geom is None:
@@ -267,8 +333,11 @@ def box_intersection_test(
     if n_colliders(col) == 0:
         return False
     bpy.context.view_layer.update()
-    _sync_transforms(col)
     extents = np.broadcast_to(np.asarray(size, dtype=float), 3)
+    if forgeo.LIB is not None:
+        box = trimesh.creation.box(extents=extents)  # convex, so solid like fcl.Box
+        return _forgeo_any_overlap(col, _mesh_bvh({}, 0, box), transform)
+    _sync_transforms(col)
     fcl_geom = fcl.Box(*extents)
     probe = trimesh.collision.CollisionManager()
     _add_object_cached(
@@ -285,6 +354,15 @@ def any_self_collision(col: CollisionSet) -> bool:
     if n_colliders(col) < 2:
         return False
     bpy.context.view_layer.update()
+    if forgeo.LIB is not None:
+        colliders = list(_forgeo_colliders(col))
+        for i, (bvh_a, T_a, bounds_a) in enumerate(colliders):
+            for bvh_b, T_b, bounds_b in colliders[i + 1 :]:
+                if _bounds_overlap(bounds_a, bounds_b) and forgeo.overlap(
+                    bvh_a, T_a, bvh_b, T_b
+                ):
+                    return True
+        return False
     _sync_transforms(col)
     return bool(col.collision_manager.in_collision_internal())
 
@@ -301,6 +379,8 @@ def raycast(
         )
 
     bpy.context.view_layer.update()
+    if forgeo.LIB is not None:
+        return _forgeo_raycast(col, ray_origins, ray_directions)
     meshes = []
     for obj in col.objs:
         mesh = col.mesh_colliders.get(_mesh_id(obj))
@@ -323,3 +403,24 @@ def raycast(
         ray_directions=np.asarray(ray_directions),
         multiple_hits=False,
     )
+
+
+def _forgeo_raycast(col: CollisionSet, ray_origins, ray_directions):
+    """Nearest hit per ray over every collider, shaped like trimesh's
+    intersects_location: index_tri counts faces in col.objs order, as in the
+    concatenated mesh the trimesh path builds."""
+    origins = np.asarray(ray_origins, dtype=np.float64).reshape(-1, 3)
+    directions = np.asarray(ray_directions, dtype=np.float64).reshape(-1, 3)
+    directions = directions / np.linalg.norm(directions, axis=1, keepdims=True)
+    best_t = np.full(len(origins), np.inf)
+    best_tri = np.full(len(origins), -1, dtype=np.int64)
+    offset = 0
+    for bvh, T, _bounds in _forgeo_colliders(col):
+        t, face = forgeo.raycast(bvh, T, origins, directions)
+        closer = (face >= 0) & (t < best_t)
+        best_t[closer] = t[closer]
+        best_tri[closer] = face[closer] + offset
+        offset += len(bvh.faces)
+    index_ray = np.flatnonzero(best_tri >= 0)
+    locations = origins[index_ray] + best_t[index_ray, None] * directions[index_ray]
+    return locations, index_ray, best_tri[index_ray]
