@@ -547,4 +547,8 @@ def cup_rand(rng: pf.RNG, material: pf.Material | None = None) -> VaseResult:
     thickness = pf.random.uniform(rng_thickness, 0.002, 0.004)
     pf.ops.modifier.solidify(obj, thickness=thickness)
     pf.ops.modifier.subdivide_surface(obj, levels=1, _skip_apply=True)
+    # the floor is one (4 * ridges)-gon; limit-surface evaluation of its hub vertex grows
+    # ~cubically with valence (110s at 320 sides), and skipping it moves verts < 1mm.
+    # Set on bpy directly: procfunc's subdivide_surface has no such arg, so --trace drops it
+    obj.item().modifiers[-1].use_limit_surface = False
     return VaseResult(mesh=obj)
